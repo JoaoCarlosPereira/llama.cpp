@@ -343,6 +343,37 @@ private:
 
     ggml_backend_sched_ptr sched;
 
+    // Paired decode graph + dedicated scheduler.
+    //
+    // Upstream keeps a single graph slot, so a workload whose graph type and n_tokens change every
+    // step (speculative decoding with MTP) only reuses about 30% of the time.  Adding slots does
+    // not help while there is a single scheduler: allocation has to be redone and the value PER HIT
+    // drops to a fifteenth -- an experiment that pushed reuse to 88% still gained only +0.21%.  Giving each slot its own scheduler restores upstream's
+    // "skip everything, keep the allocation" reuse.
+    //
+    // Each slot needs its own compute buffer, but a decode graph is only 7.83 MiB at ubatch 8
+    // (the main scheduler needs 2004 MiB for prefill).  Larger ubatches keep using it.
+    struct dec_slot {
+        ggml_backend_sched_ptr sched;
+        llm_graph_result_ptr   res;
+
+        bool     valid    = false;
+        uint64_t last_use = 0;
+    };
+
+    std::vector<dec_slot> dec_slots;
+
+    int      dec_cur     = -1; // slot in use (-1 = main scheduler)
+    uint64_t dec_clock   = 0;
+    int      dec_max_tok = 0;  // use a slot when n_tokens is at most this
+
+    // The scheduler that currently holds the allocation; output retrieval and graph_compute use it.
+    ggml_backend_sched_t sched_active() const {
+        return dec_cur < 0 ? sched.get() : dec_slots[dec_cur].sched.get();
+    }
+
+    void dec_slots_invalidate();
+
     bool sched_need_reserve = true;
 
     ggml_backend_t backend_cpu = nullptr;

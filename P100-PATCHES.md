@@ -52,7 +52,7 @@ models listed above; inert patches are kept to stay close to the upstream patch 
 | 19 | fuse-pre-add-rms-norm | CUDA | clean | yes |
 | 20 | fuse-add-unary-mul | CUDA (delta-net) | clean | qwen35 |
 | 21 | sched-reset-lazy | host | clean | yes |
-| 22 | decode-sched-slots | host | **deferred** (see below) | speculative decoding only |
+| 22 | decode-sched-slots | host | clean | speculative decoding only |
 | 23 | fuse-gdn-beta-sigmoid | CUDA (delta-net) | clean | qwen35 |
 | 24 | fuse-gdn-state-gather | CUDA (delta-net) | clean | qwen35 |
 | 25 | gdn-gather-single-snapshot | CUDA (delta-net) | clean | qwen35 |
@@ -91,13 +91,11 @@ Upstream renamed the sampling copy helpers (`copy_tensor_async_ints/floats/candi
 `copy_tensor_async_rows`, #25532). The conflict is the 4 calls in `llama_context::decode`;
 resolution is `sched.get()` -> `sched_active()` on the new lines.
 
-Deferred 2026-08-26. The patch only pays off when the decode graph shape changes every step
-(MTP speculative decoding: draft graph, then a verify batch of n_draft+1), where upstream's
-single cached graph is reused ~14% of the time. Without speculative decoding every decode
-step has the same shape and upstream reuse already hits, so the measured +0.97% (4 slots,
-+72 MiB VRAM) does not apply. It also adds four `ggml_backend_sched` instances with their own
-compute buffers, which is more surface for `-sm tensor`. Revisit when MTP is switched on, and
-then measure `LLAMA_DEC_SLOTS=0` vs `4` on the real workload instead of trusting the number.
+Resolved 2026-10-24. Applied with `copy_tensor_async_rows(..., sched_active())` and
+`graph_compute` via `sched_active()`. Allows dedicated scheduler slots (`LLAMA_DEC_SLOTS` and
+`LLAMA_DEC_MAX_TOK`) to eliminate graph rebuilds and buffer realocations during speculative
+decoding/MTP. Recommended: `LLAMA_DEC_SLOTS=1` and `LLAMA_DEC_MAX_TOK=1` on 16GB P100s (+7.8 MiB
+VRAM) to maintain 100% graph reuse during draft steps without OOM.
 
 ### Meta backend gist
 
