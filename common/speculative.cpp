@@ -128,6 +128,46 @@ static bool common_speculative_are_compatible(
     return true;
 }
 
+// Dynamic context-aware speculative draft scaling:
+// Adapts speculative draft depth (n_max) and confidence threshold (p_min) dynamically
+// based on KV cache position (n_past) to maintain maximum decoding throughput across
+// both shallow and extreme context regimes (avoiding KV bandwidth penalties).
+static inline void get_dynamic_draft_params(
+    llama_pos n_past,
+    int32_t   base_n_max,
+    int32_t   base_n_min,
+    float     base_p_min,
+    int32_t & eff_n_max,
+    int32_t & eff_n_min,
+    float   & eff_p_min
+) {
+    eff_n_max = base_n_max;
+    eff_n_min = base_n_min;
+    eff_p_min = base_p_min;
+
+    const char * env_disable = getenv("LLAMA_SPEC_DYNAMIC_DRAFT_DISABLE");
+    if (env_disable && (strcmp(env_disable, "1") == 0 || strcmp(env_disable, "true") == 0)) {
+        return;
+    }
+
+    if (n_past >= 65536) {
+        eff_n_max = std::min(base_n_max, 2);
+        eff_p_min = std::max(base_p_min, 0.80f);
+    } else if (n_past >= 32768) {
+        eff_n_max = std::min(base_n_max, 3);
+        eff_p_min = std::max(base_p_min, 0.75f);
+    } else if (n_past >= 16384) {
+        eff_n_max = std::min(base_n_max, 4);
+        eff_p_min = std::max(base_p_min, 0.70f);
+    } else {
+        if (base_p_min <= 0.0f) {
+            eff_p_min = 0.60f;
+        }
+    }
+    eff_n_max = std::max(1, eff_n_max);
+    eff_n_min = std::min(eff_n_min, eff_n_max);
+}
+
 using common_speculative_draft_params_vec = std::vector<common_speculative_draft_params>;
 
 // state of an implementation of speculative decoding
@@ -331,8 +371,18 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
                 // add drafted token for each sequence
                 const llama_token id = cur_p->data[0].id;
 
+                auto & dp = dparams.at(seq_id);
+                int32_t eff_n_max = params.n_max;
+                int32_t eff_n_min = params.n_min;
+                float   eff_p_min = params.p_min;
+                get_dynamic_draft_params(dp.n_past, params.n_max, params.n_min, params.p_min, eff_n_max, eff_n_min, eff_p_min);
+                if (dp.n_max > 0) {
+                    eff_n_max = std::min(eff_n_max, dp.n_max);
+                    eff_n_min = std::min(eff_n_min, eff_n_max);
+                }
+
                 // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
+                if (cur_p->data[0].p < eff_p_min) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -341,13 +391,11 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
 
                 common_sampler_accept(smpl, id, true);
 
-                auto & dp = dparams.at(seq_id);
                 auto & result = *dp.result;
 
                 result.push_back(id);
 
-                if ((params.n_max <= (int) result.size()) ||
-                    (dp.n_max > 0 && dp.n_max <= (int) result.size())) {
+                if (eff_n_max <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -375,7 +423,16 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
                 continue;
             }
 
-            if (dp.result->size() < (size_t) params.n_min) {
+            int32_t eff_n_max = params.n_max;
+            int32_t eff_n_min = params.n_min;
+            float   eff_p_min = params.p_min;
+            get_dynamic_draft_params(dp.n_past, params.n_max, params.n_min, params.p_min, eff_n_max, eff_n_min, eff_p_min);
+            if (dp.n_max > 0) {
+                eff_n_max = std::min(eff_n_max, dp.n_max);
+                eff_n_min = std::min(eff_n_min, eff_n_max);
+            }
+
+            if (dp.result->size() < (size_t) eff_n_min) {
                 dp.result->clear();
             }
         }
@@ -792,9 +849,19 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
                 const llama_token id = cur_p->data[0].id;
 
+                auto & dp = dparams.at(seq_id);
+                int32_t eff_n_max = params.n_max;
+                int32_t eff_n_min = params.n_min;
+                float   eff_p_min = params.p_min;
+                get_dynamic_draft_params(dp.n_past, params.n_max, params.n_min, params.p_min, eff_n_max, eff_n_min, eff_p_min);
+                if (dp.n_max > 0) {
+                    eff_n_max = std::min(eff_n_max, dp.n_max);
+                    eff_n_min = std::min(eff_n_min, eff_n_max);
+                }
+
                 // only collect very high-confidence draft tokens
                 // (configurable via --spec-draft-p-min, set to 0.0 to disable early-stop)
-                if (cur_p->data[0].p < params.p_min) {
+                if (cur_p->data[0].p < eff_p_min) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -803,12 +870,11 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
                 common_sampler_accept(smpl, id, true);
 
-                auto & dp = dparams.at(seq_id);
                 auto & result = *dp.result;
 
                 result.push_back(id);
 
-                if (params.n_max <= (int) result.size()) {
+                if (eff_n_max <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -837,7 +903,16 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
                 continue;
             }
 
-            if (dp.result->size() < (size_t) params.n_min) {
+            int32_t eff_n_max = params.n_max;
+            int32_t eff_n_min = params.n_min;
+            float   eff_p_min = params.p_min;
+            get_dynamic_draft_params(dp.n_past, params.n_max, params.n_min, params.p_min, eff_n_max, eff_n_min, eff_p_min);
+            if (dp.n_max > 0) {
+                eff_n_max = std::min(eff_n_max, dp.n_max);
+                eff_n_min = std::min(eff_n_min, eff_n_max);
+            }
+
+            if (dp.result->size() < (size_t) eff_n_min) {
                 dp.result->clear();
             }
         }
@@ -1180,7 +1255,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             const int32_t n = (int32_t) dp.n_past;
 
-            const int32_t n_draft = params.n_max;
+            int32_t eff_n_max = params.n_max;
+            int32_t eff_n_min = params.n_min;
+            float   eff_p_min = params.p_min;
+            get_dynamic_draft_params(dp.n_past, params.n_max, params.n_min, params.p_min, eff_n_max, eff_n_min, eff_p_min);
+            if (dp.n_max > 0) {
+                eff_n_max = std::min(eff_n_max, dp.n_max);
+                eff_n_min = std::min(eff_n_min, eff_n_max);
+            }
+
+            const int32_t n_draft = eff_n_max;
 
             const int32_t n_block_tokens = n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.n_tokens;
@@ -1214,15 +1298,24 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             auto & result = *dp.result;
 
+            int32_t eff_n_max = params.n_max;
+            int32_t eff_n_min = params.n_min;
+            float   eff_p_min = params.p_min;
+            get_dynamic_draft_params(dp.n_past, params.n_max, params.n_min, params.p_min, eff_n_max, eff_n_min, eff_p_min);
+            if (dp.n_max > 0) {
+                eff_n_max = std::min(eff_n_max, dp.n_max);
+                eff_n_min = std::min(eff_n_min, eff_n_max);
+            }
+
             if (is_dspark) {
                 // DSpark: read from the first draft slot, truncate below the confidence threshold
-                const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
+                const float * conf = eff_p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
                 // bonus-anchor drafts read the mask positions only, like DFlash
                 const int32_t i_draft_beg = sample_from_anchor ? 0 : 1;
                 for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
                     const int32_t idx = beg + i;
 
-                    if (conf && conf[(size_t) idx * n_embd_dec] < params.p_min) {
+                    if (conf && conf[(size_t) idx * n_embd_dec] < eff_p_min) {
                         break;
                     }
 
@@ -1257,7 +1350,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     const llama_token id = cur_p->data[0].id;
 
-                    if (cur_p->data[0].p < params.p_min) {
+                    if (cur_p->data[0].p < eff_p_min) {
                         break;
                     }
 
@@ -1267,7 +1360,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }
             }
 
-            if (result.size() < (size_t) params.n_min) {
+            if (result.size() < (size_t) eff_n_min) {
                 result.clear();
             }
         }
@@ -1632,8 +1725,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 // add drafted token for each sequence
                 const llama_token id = cur_p->data[0].id;
 
+                auto & dp = dparams.at(seq_id);
+                int32_t eff_n_max = params.n_max;
+                int32_t eff_n_min = params.n_min;
+                float   eff_p_min = params.p_min;
+                get_dynamic_draft_params(dp.n_past, params.n_max, params.n_min, params.p_min, eff_n_max, eff_n_min, eff_p_min);
+                if (dp.n_max > 0) {
+                    eff_n_max = std::min(eff_n_max, dp.n_max);
+                    eff_n_min = std::min(eff_n_min, eff_n_max);
+                }
+
                 // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
+                if (cur_p->data[0].p < eff_p_min) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -1642,12 +1745,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 common_sampler_accept(smpl, id, true);
 
-                auto & dp = dparams.at(seq_id);
                 auto & result = *dp.result;
 
                 result.push_back(id);
 
-                if (params.n_max <= (int) result.size()) {
+                if (eff_n_max <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -1694,7 +1796,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
-            if (dp.result->size() < (size_t) params.n_min) {
+            int32_t eff_n_max = params.n_max;
+            int32_t eff_n_min = params.n_min;
+            float   eff_p_min = params.p_min;
+            get_dynamic_draft_params(dp.n_past, params.n_max, params.n_min, params.p_min, eff_n_max, eff_n_min, eff_p_min);
+            if (dp.n_max > 0) {
+                eff_n_max = std::min(eff_n_max, dp.n_max);
+                eff_n_min = std::min(eff_n_min, eff_n_max);
+            }
+
+            if (dp.result->size() < (size_t) eff_n_min) {
                 dp.result->clear();
             }
         }
