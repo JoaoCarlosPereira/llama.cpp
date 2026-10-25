@@ -150,7 +150,10 @@ static inline void get_dynamic_draft_params(
         return;
     }
 
-    if (n_past >= 65536) {
+    if (n_past >= 98304) {
+        eff_n_max = std::min(base_n_max, 1);
+        eff_p_min = std::max(base_p_min, 0.85f);
+    } else if (n_past >= 65536) {
         eff_n_max = std::min(base_n_max, 2);
         eff_p_min = std::max(base_p_min, 0.80f);
     } else if (n_past >= 32768) {
